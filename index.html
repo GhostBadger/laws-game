@@ -115,6 +115,10 @@
 
 #lg .result .gain{display:block;font-family:var(--mono);font-size:.55em;margin-top:4px}
 #lg .result .fa-inline{font-family:"Vazirmatn",Tahoma,sans-serif;font-weight:700}
+
+#lg .lat{font-family:var(--mono);font-size:.75rem;text-align:center;color:var(--muted);margin-top:4px}
+#lg .lat-good{color:var(--good)} #lg .lat-ok{color:var(--k3)} #lg .lat-bad{color:var(--accent)}
+#lg .chip small{font-family:var(--mono);font-size:.72rem;margin-left:4px}
 </style></head>
 <body><div id="lg"><div class="top"><svg width="32" height="32" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 2l4 3 5-1 2 5 5 2-1 5 3 4-3 4 1 5-5 2-2 5-5-1-4 3-4-3-5 1-2-5-5-2 1-5-3-4 3-4-1-5 5-2 2-5 5 1z" fill="var(--accent)"/><text x="20" y="25" text-anchor="middle" font-family="Gloock, Georgia, serif" font-size="14" fill="var(--accent-ink)">&#167;</text></svg><b>Study Lab</b><span class="sub">Live game</span><div class="langsw"></div></div><div class="lg-main"><p>Loading the game…</p></div></div>
 <script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
@@ -774,6 +778,7 @@ let S = null, tickTimer = null, wake = null;
 const HSET = Object.assign({n:15, topic:"all", dur:20, requeue:true}, (() => { try { return JSON.parse(store.get("lg:hostset") || "{}"); } catch(e){ return {}; } })());
 // Everyone connects OUT to a public relay (works through home/school/mobile networks). The host listens on all of them.
 const RELAYS = window.LG_RELAYS || ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt", "wss://test.mosquitto.org:8081/mqtt"];
+const latClass = ms => ms == null ? "" : ms < 350 ? "lat-good" : ms < 1000 ? "lat-ok" : "lat-bad";
 const TOPIC = code => "fanshawe-laws1030/v2/" + code;
 const parse = b => { try { return JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b)); } catch(e){ return null; } };
 const RELAY_ERR = "Couldn't reach the game relay from this network. Switch between Wi-Fi and mobile data, then try again.";
@@ -788,20 +793,25 @@ function relayConnect(url, opts={}){
     c.once("connect", () => { ok = true; clearTimeout(t); resolve(c); });
   });
 }
-// Players: try every relay at once and keep whichever answers first
-function firstRelay(){
-  return new Promise((resolve, reject) => {
-    let done = false, fails = 0;
-    RELAYS.forEach(url => relayConnect(url).then(c => { if (done) { try { c.end(true); } catch(e){} return; } done = true; resolve(c); }).catch(() => { if (++fails === RELAYS.length && !done) reject(new Error("none")); }));
-  });
-}
+// Timers that keep running at full speed even if this tab is in the background (browsers slow normal timers down)
+const WT = (() => {
+  try {
+    const src = "const t={};onmessage=e=>{const [op,id,ms]=e.data;if(op==='s'){t[id]=setTimeout(()=>{postMessage(id);delete t[id]},ms)}else if(op==='i'){t[id]=setInterval(()=>postMessage(id),ms)}else{clearTimeout(t[id]);clearInterval(t[id]);delete t[id]}}";
+    const w = new Worker(URL.createObjectURL(new Blob([src], {type:"text/javascript"})));
+    const cbs = {}; let n = 0;
+    w.onmessage = e => { const f = cbs[e.data]; if (f) f(); };
+    return { set(fn, ms){ const id = ++n; cbs[id] = () => { delete cbs[id]; fn(); }; w.postMessage(["s", id, ms]); return id; },
+             every(fn, ms){ const id = ++n; cbs[id] = fn; w.postMessage(["i", id, ms]); return id; },
+             clear(id){ if (id == null) return; delete cbs[id]; w.postMessage(["c", id]); } };
+  } catch(e) { return { set:(f,ms)=>setTimeout(f,ms), every:(f,ms)=>setInterval(f,ms), clear:id=>{ clearTimeout(id); clearInterval(id); } }; }
+})();
 const joinUrl = code => location.href.split("#")[0].split("?")[0] + "?join=" + code;
 function keepAwake(){ try { if (navigator.wakeLock && !wake) navigator.wakeLock.request("screen").then(w => { wake = w; w.addEventListener("release", () => { wake = null; }); }).catch(()=>{}); } catch(e){} }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && S) { keepAwake(); (S.clients||[]).forEach(c => { try { if (c && !c.connected) c.reconnect(); } catch(e){} }); } });
 function startTick(){ clearInterval(tickTimer); tickTimer = setInterval(paintTimer, 200); }
 function endSession(){
   if (S) {
-    clearTimeout(S.timer); clearInterval(S.beat);
+    WT.clear(S.timer); WT.clear(S.beat); WT.clear(S.probeTimer); WT.clear(S.ansTimer);
     (S.clients||[]).forEach(c => { if (!c) return; try { if (S.role === "host") c.publish(TOPIC(S.code)+"/host", "", {retain:true, qos:1}); c.end(false); } catch(e){} });
   }
   S = null;
@@ -888,7 +898,7 @@ function host(n, topic, dur, requeue){
       draw();
     }).catch(() => { if (S !== H) return; H.failed++; if (H.failed === RELAYS.length) { H.err = RELAY_ERR; draw(); } });
   });
-  H.beat = setInterval(() => {
+  H.beat = WT.every(() => {
     if (S !== H) return;
     const now = Date.now(); let changed = false;
     for (const p of Object.values(H.players)) { const here = now - (p.seen||0) < 16000; if (here !== p.here) { p.here = here; changed = true; } }
@@ -905,6 +915,8 @@ function checkAll(H){
 function onMsg(H, via, d){
   if (!d || typeof d !== "object") return;
   const tk = String(d.tk || "").slice(0, 20); if (!tk) return;
+  if (d.t === "probe" || d.t === "ping") { const c = H.clients[via]; if (c && c.connected) { try { c.publish(TOPIC(H.code)+"/to/"+tk, JSON.stringify({t:"pong", ts:d.ts}), {qos:0}); } catch(e){} } }
+  if (d.t === "probe") return;
   let p = H.players[tk];
   if (d.t === "hello" || (!p && typeof d.name === "string")) {
     const name = String(d.name || "").replace(/\s+/g, " ").trim().slice(0, 20) || "Player";
@@ -915,6 +927,7 @@ function onMsg(H, via, d){
   }
   if (!p) return;
   p.seen = Date.now(); p.via = via;
+  if (typeof d.lat === "number" && d.lat >= 0 && d.lat < 60000) { const old = p.lat; p.lat = Math.round(d.lat); if (H.phase === "lobby" && latClass(old) !== latClass(p.lat)) draw(); }
   if (!p.here) { p.here = true; draw(); }
   if (d.t === "answer") {
     if (H.phase !== "question" || d.qi !== H.qi || tk in H.answers) return;
@@ -943,16 +956,16 @@ function stateFor(H, tk){
   }
   return st;
 }
-function sendTo(H, tk){ const p = H.players[tk]; if (!p) return; const c = (H.clients[p.via] && H.clients[p.via].connected) ? H.clients[p.via] : H.clients.find(x => x && x.connected); if (c) { try { c.publish(TOPIC(H.code)+"/to/"+tk, JSON.stringify(stateFor(H, tk)), {qos:1}); } catch(e){} } }
+function sendTo(H, tk){ const p = H.players[tk]; if (!p) return; const c = (H.clients[p.via] && H.clients[p.via].connected) ? H.clients[p.via] : H.clients.find(x => x && x.connected); if (c) { try { c.publish(TOPIC(H.code)+"/to/"+tk, JSON.stringify(stateFor(H, tk)), {qos:0}); } catch(e){} } }
 function sendAll(H){ for (const tk in H.players) sendTo(H, tk); }
 function nextQuestion(H){
   H.qi++; H.answers = {}; H.phase = "question"; H.qStart = Date.now();
-  clearTimeout(H.timer); if (H.dur) H.timer = setTimeout(() => reveal(H), H.dur*1000 + 500);
+  WT.clear(H.timer); if (H.dur) H.timer = WT.set(() => reveal(H), H.dur*1000 + 500);
   sendAll(H); draw();
 }
 function reveal(H){
   if (H.phase !== "question") return;
-  clearTimeout(H.timer);
+  WT.clear(H.timer);
   const q = H.qs[H.qi]; H.counts = q.o.map(() => 0); H.solves = 0; let anyMiss = false;
   for (const [tk, p] of Object.entries(H.players)) {
     const ans = H.answers[tk]; let gain = 0, ok = false;
@@ -972,38 +985,57 @@ function finish(H){ H.phase = "final"; sendAll(H); draw(); }
 // ---------- player ----------
 async function join(code, name){
   endSession();
-  const P = {role:"player", code, name, st:null, picked:null, deadline:0, status:"connecting", err:"", clients:[], last:""};
+  const P = {role:"player", code, name, st:null, picked:null, deadline:0, status:"connecting", err:"", clients:[], last:"", lat:null};
   S = P; startTick(); draw();
   const T = TOPIC(code);
-  let c = null;
-  try { c = await firstRelay(); } catch(e) {}
-  if (S !== P) { if (c) { try { c.end(true); } catch(e){} } return; }
-  if (!c) { P.status = "error"; P.err = RELAY_ERR; draw(); return; }
-  P.c = c; P.clients = [c];
-  c.subscribe([T+"/to/"+token, T+"/host"], {qos:1});
-  c.on("message", (tp, buf) => {
-    if (S !== P) return;
-    if (tp.endsWith("/host")) { const alive = !!(buf && buf.length); if (!alive && P.st && P.st.phase !== "final") { P.status = "hostgone"; draw(); } return; }
-    apply(P, parse(buf));
-  });
-  c.on("connect", () => { if (S === P) { if (P.status === "reconnecting") P.status = P.st ? "in" : "joining"; upP(P, {t:"hello", name:P.name}); draw(); } });
-  c.on("offline", () => { if (S === P && P.status === "in") { P.status = "reconnecting"; draw(); } });
-  P.status = "joining"; upP(P, {t:"hello", name:P.name}); draw();
-  P.beat = setInterval(() => { if (S === P) upP(P, P.st ? {t:"ping", name:P.name} : {t:"hello", name:P.name}); }, 5000);
-  P.timer = setTimeout(() => { if (S === P && !P.st) { P.status = "nogame"; P.err = "No game with that code is running. Check the code with the host."; draw(); } }, 10000);
+  let chosen = null, fails = 0;
+  const cands = [];
+  const probe = c => { try { if (c.connected) c.publish(T+"/up", JSON.stringify({tk:token, t:"probe", ts:Date.now()}), {qos:0}); } catch(e){} };
+  const choose = c => {
+    if (chosen || S !== P) return;
+    chosen = c; WT.clear(P.probeTimer);
+    cands.forEach(x => { if (x !== c) { try { x.end(true); } catch(e){} } });
+    P.c = c; P.clients = [c];
+    c.on("connect", () => { if (S === P) { if (P.status === "reconnecting") P.status = P.st ? "in" : "joining"; upP(P, {t:"hello", name:P.name}, 1); resendAnswer(P); draw(); } });
+    c.on("offline", () => { if (S === P && P.status === "in") { P.status = "reconnecting"; draw(); } });
+    P.status = "joining"; upP(P, {t:"hello", name:P.name}, 1); draw();
+    P.beat = WT.every(() => { if (S === P) upP(P, P.st ? {t:"ping", name:P.name, ts:Date.now(), lat:P.lat} : {t:"hello", name:P.name}, P.st ? 0 : 1); }, 4000);
+  };
+  RELAYS.forEach(url => relayConnect(url).then(c => {
+    if (S !== P || chosen) { try { c.end(true); } catch(e){} return; }
+    cands.push(c);
+    c.on("message", (tp, buf) => {
+      if (S !== P) return;
+      if (!chosen) { const d = parse(buf); if (d && d.t === "pong" && tp.endsWith("/to/"+token)) { P.lat = Date.now() - (d.ts || Date.now()); choose(c); } return; }
+      if (c === P.c) onPlayerMsg(P, tp, buf);
+    });
+    c.subscribe([T+"/to/"+token, T+"/host"], {qos:0}, () => probe(c));
+  }).catch(() => { if (++fails === RELAYS.length && S === P && !chosen) { P.status = "error"; P.err = RELAY_ERR; draw(); } }));
+  P.probeTimer = WT.every(() => { if (chosen || S !== P) return WT.clear(P.probeTimer); if (cands.length && P.status === "connecting") { P.status = "looking"; draw(); } cands.forEach(probe); }, 1200);
+  P.timer = WT.set(() => { if (S === P && !P.st) { WT.clear(P.probeTimer); cands.forEach(x => { if (x !== P.c) { try { x.end(true); } catch(e){} } }); P.status = "nogame"; P.err = "No game with that code is running. Check the code with the host."; draw(); } }, 12000);
 }
-function upP(P, msg){ try { if (P.c && P.c.connected) P.c.publish(TOPIC(P.code)+"/up", JSON.stringify(Object.assign({tk:token}, msg)), {qos:1}); } catch(e){} }
+function onPlayerMsg(P, tp, buf){
+  if (tp.endsWith("/host")) { const alive = !!(buf && buf.length); if (!alive && P.st && P.st.phase !== "final") { P.status = "hostgone"; draw(); } return; }
+  const d = parse(buf); if (!d) return;
+  if (d.t === "pong") { P.lat = Date.now() - (d.ts || Date.now()); const el = $("#lat"); if (el) { el.textContent = `Connection: ${P.lat} ms`; el.className = "lat " + latClass(P.lat); } return; }
+  apply(P, d);
+}
+function upP(P, msg, qos=0){ try { if (P.c && P.c.connected) P.c.publish(TOPIC(P.code)+"/up", JSON.stringify(Object.assign({tk:token}, msg)), {qos}); } catch(e){} }
+function resendAnswer(P){ if (P.ans && P.st && P.st.phase === "question" && P.st.qi === P.ans.qi) upP(P, {t:"answer", qi:P.ans.qi, a:P.ans.a}, 1); }
 function apply(P, st){
   if (!st || typeof st !== "object" || st.code !== P.code) return;
   const js = JSON.stringify(st); if (js === P.last && P.status === "in") return; P.last = js;
-  clearTimeout(P.timer); if (P.status !== "in") P.status = "in";
+  WT.clear(P.timer); if (P.status !== "in") P.status = "in";
+  if (P.ans && (st.phase !== "question" || st.qi !== P.ans.qi || st.answered)) { WT.clear(P.ansTimer); P.ans = null; }
   if (st.phase === "question" && (!P.st || P.st.phase !== "question" || P.st.qi !== st.qi)) { P.picked = st.answered ? -2 : null; P.deadline = st.dur ? Date.now() + (Number(st.left) || 0) : 0; }
   P.st = st; draw();
 }
 function pick(n){
   const P = S; if (!P || P.role !== "player" || !P.st || P.st.phase !== "question" || P.picked !== null) return;
   if (P.deadline && Date.now() > P.deadline) return;
-  P.picked = n; upP(P, {t:"answer", qi:P.st.qi, a:n}); draw();
+  P.picked = n; P.ans = {qi:P.st.qi, a:n}; upP(P, {t:"answer", qi:P.st.qi, a:n}, 1);
+  WT.clear(P.ansTimer); P.ansTimer = WT.every(() => { if (S !== P || !P.ans) return WT.clear(P.ansTimer); resendAnswer(P); }, 1500);
+  draw();
 }
 // the shown question as a question object (for Farsi and for Solve)
 // ---------- drawing ----------
@@ -1047,7 +1079,8 @@ function drawHost(H){
       <div class="joinbox">${qr?`<div class="qr" aria-label="QR code to join">${qr}</div>`:""}<div class="bigcode">${esc(H.code)}</div></div>
       <span class="url">${esc(url)}</span>
       <p class="muted">${here.length} joined · ${H.qs.length} questions · ${H.dur?H.dur+" seconds each":"no time limit"}${H.requeue?" · missed questions come back":""}</p>
-      <div class="players">${here.map(p=>`<span class="chip">${esc(p.name)}</span>`).join("") || `<span class="muted">Waiting for players…</span>`}</div>
+      <div class="players">${here.map(p=>`<span class="chip">${esc(p.name)}${p.lat!=null?` <small class="${latClass(p.lat)}">${p.lat} ms</small>`:""}</span>`).join("") || `<span class="muted">Waiting for players…</span>`}</div>
+      <p class="muted" style="font-size:.82rem">Game relays connected: ${H.clients.filter(c=>c&&c.connected).length} of ${RELAYS.length}. Keep this window in front while hosting.</p>
       <div class="row" style="justify-content:center"><button class="btn primary" id="hStart" ${H.qs.length?"":"disabled"}>Start game</button><button class="btn ghost" id="hEnd">Cancel</button></div></div>`;
   } else if (H.phase === "question") {
     const q = H.qs[H.qi]; const sq = shownQ({id:q.id, q:{o:q.o}});
@@ -1079,7 +1112,7 @@ function drawHost(H){
 }
 function drawPlayer(P){
   const st = P.st; let body;
-  if (P.status === "connecting" || P.status === "joining") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>Joining…</h2><p class="muted">${P.status === "connecting" ? "Connecting to the game relay…" : "Connected. Looking for the host…"}</p></div>`;
+  if (P.status === "connecting" || P.status === "looking" || P.status === "joining") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>Joining…</h2><p class="muted">${P.status === "connecting" ? "Connecting to the game relays…" : P.status === "looking" ? "Connected. Looking for the host…" : "Found the host. Joining…"}</p></div>`;
   else if (P.status === "nogame" || P.status === "error") body = `<div class="stack center"><div class="err">${esc(P.err)}</div><div class="row" style="justify-content:center"><button class="btn primary" id="pRetry">Try again</button><button class="btn ghost" id="pBack">Change code</button></div></div>`;
   else if (P.status === "hostgone") body = `<div class="stack center"><h2>The host ended this game</h2><button class="btn primary" id="pBack">Back</button></div>`;
   else if (!st || st.phase === "lobby") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>${ui(LANG,"You're in","youreIn")}, ${esc(P.name)}</h2><p class="muted">${ui(LANG,"Waiting for the host to start.","waitHost")}${st&&st.players?` ${st.players.length} ${st.players.length===1?"player":"players"} so far.`:""}</p></div>`;
@@ -1104,6 +1137,7 @@ function drawPlayer(P){
     body = `<p class="score" style="text-align:center">You finished #${y.rank||"–"} with ${y.pts||0} pts</p>` + podiumHTML(st.board || [], P.name);
   }
   if (P.status === "reconnecting") body = `<p class="note" style="text-align:center">Reconnecting… your score is safe.</p>` + body;
+  if (P.lat != null && P.status !== "error" && P.status !== "nogame") body += `<p id="lat" class="lat ${latClass(P.lat)}">Connection: ${P.lat} ms</p>`;
   main.innerHTML = `<div class="panel stack">${body}<div class="row" style="justify-content:center"><button class="btn ghost" id="pLeave" style="font-size:.88rem">Leave game</button></div></div>`;
   root.querySelectorAll(".kbtn[data-n]").forEach(b => b.onclick = () => pick(+b.dataset.n));
   const on = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
