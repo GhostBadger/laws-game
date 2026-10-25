@@ -117,7 +117,7 @@
 #lg .result .fa-inline{font-family:"Vazirmatn",Tahoma,sans-serif;font-weight:700}
 </style></head>
 <body><div id="lg"><div class="top"><svg width="32" height="32" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 2l4 3 5-1 2 5 5 2-1 5 3 4-3 4 1 5-5 2-2 5-5-1-4 3-4-3-5 1-2-5-5-2 1-5-3-4 3-4-1-5 5-2 2-5 5 1z" fill="var(--accent)"/><text x="20" y="25" text-anchor="middle" font-family="Gloock, Georgia, serif" font-size="14" fill="var(--accent-ink)">&#167;</text></svg><b>Study Lab</b><span class="sub">Live game</span><div class="langsw"></div></div><div class="lg-main"><p>Loading the game…</p></div></div>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script>(function(){
 // ===== LAWS-1030 content bank (from the Consideration + Capacity test review) =====
@@ -763,7 +763,6 @@ const main = root.querySelector(".lg-main");
 const $ = s => root.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const shuffle = a => { a=[...a]; for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; };
-const PREFIX = "fanshawe-laws1030-";
 const CODECHARS = "abcdefghjkmnpqrstuvwxyz23456789";
 const KCOLS = ["var(--k1)","var(--k2)","var(--k3)","var(--k4)"];
 const SHAPES = [`<svg viewBox="0 0 24 24"><path d="M12 3 22 21H2z"/></svg>`,`<svg viewBox="0 0 24 24"><path d="M12 2 22 12 12 22 2 12z"/></svg>`,`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>`,`<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18"/></svg>`];
@@ -773,20 +772,40 @@ if (!token) { token = Math.random().toString(36).slice(2, 12); try { sessionStor
 let LANG = LANGS[store.get("lg:lang")] ? store.get("lg:lang") : "en";
 let S = null, tickTimer = null, wake = null;
 const HSET = Object.assign({n:15, topic:"all", dur:20, requeue:true}, (() => { try { return JSON.parse(store.get("lg:hostset") || "{}"); } catch(e){ return {}; } })());
-const PEER_ERR = {
-  "browser-incompatible":"This browser can't run the game. Try Chrome, Safari or Edge.",
-  "network":"Lost the connection to the game service. Check the internet and try again.",
-  "server-error":"The free connection service didn't answer. Try again in a minute.",
-  "socket-error":"The free connection service didn't answer. Try again in a minute.",
-  "peer-unavailable":"No game with that code is running. Check the code with the host.",
-  "unavailable-id":"That code is taken. Making a new one…"
-};
-const errText = e => PEER_ERR[e && e.type] || "Something went wrong with the connection. Try again.";
+// Everyone connects OUT to a public relay (works through home/school/mobile networks). The host listens on all of them.
+const RELAYS = window.LG_RELAYS || ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt", "wss://test.mosquitto.org:8081/mqtt"];
+const TOPIC = code => "fanshawe-laws1030/v2/" + code;
+const parse = b => { try { return JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b)); } catch(e){ return null; } };
+const RELAY_ERR = "Couldn't reach the game relay from this network. Switch between Wi-Fi and mobile data, then try again.";
+function relayConnect(url, opts={}){
+  return new Promise((resolve, reject) => {
+    let c; try { c = mqtt.connect(url, Object.assign({connectTimeout:6000, reconnectPeriod:2500, clean:true, keepalive:30, clientId:"lg_" + Math.random().toString(16).slice(2, 12)}, opts)); } catch(e) { return reject(e); }
+    let ok = false;
+    c.on("error", () => {});
+    const fail = () => { if (ok) return; clearTimeout(t); try { c.end(true); } catch(e){} reject(new Error("failed")); };
+    const t = setTimeout(fail, 8000);
+    c.once("close", fail);
+    c.once("connect", () => { ok = true; clearTimeout(t); resolve(c); });
+  });
+}
+// Players: try every relay at once and keep whichever answers first
+function firstRelay(){
+  return new Promise((resolve, reject) => {
+    let done = false, fails = 0;
+    RELAYS.forEach(url => relayConnect(url).then(c => { if (done) { try { c.end(true); } catch(e){} return; } done = true; resolve(c); }).catch(() => { if (++fails === RELAYS.length && !done) reject(new Error("none")); }));
+  });
+}
 const joinUrl = code => location.href.split("#")[0].split("?")[0] + "?join=" + code;
 function keepAwake(){ try { if (navigator.wakeLock && !wake) navigator.wakeLock.request("screen").then(w => { wake = w; w.addEventListener("release", () => { wake = null; }); }).catch(()=>{}); } catch(e){} }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && S) { keepAwake(); if (S.peer && S.peer.disconnected && !S.peer.destroyed) { try { S.peer.reconnect(); } catch(e){} } if (S.role === "player" && S.status === "lost") rejoin(S); } });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && S) { keepAwake(); (S.clients||[]).forEach(c => { try { if (c && !c.connected) c.reconnect(); } catch(e){} }); } });
 function startTick(){ clearInterval(tickTimer); tickTimer = setInterval(paintTimer, 200); }
-function endSession(){ if (S && S.peer) { try { S.peer.destroy(); } catch(e){} } clearTimeout(S && S.timer); S = null; }
+function endSession(){
+  if (S) {
+    clearTimeout(S.timer); clearInterval(S.beat);
+    (S.clients||[]).forEach(c => { if (!c) return; try { if (S.role === "host") c.publish(TOPIC(S.code)+"/host", "", {retain:true, qos:1}); c.end(false); } catch(e){} });
+  }
+  S = null;
+}
 // language switch in the top bar
 function paintLang(){
   const box = root.querySelector(".langsw"); if (!box) return;
@@ -797,7 +816,7 @@ function paintLang(){
 function home(msg){
   const params = new URLSearchParams(location.search);
   const pre = (params.get("join") || "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 4);
-  const noPeer = typeof Peer === "undefined";
+  const noPeer = typeof mqtt === "undefined";
   const nChips = [5,10,15,20,30,0], tChips = [0,10,20,30,45,60];
   const total = Q.filter(q => HSET.topic === "all" || q.t === HSET.topic).length;
   main.innerHTML = `
@@ -850,43 +869,58 @@ function pickQs(n, topic){
     return {id:q.id, text:q.q, o:order.map(k=>q.o[k]), c:order.indexOf(q.a), why:q.why, t:TOPICS[q.t].name, rep:0};
   });
 }
-function host(n, topic, dur, requeue, tries=0){
+function host(n, topic, dur, requeue){
   endSession();
   const code = Array.from({length:4}, () => CODECHARS[Math.floor(Math.random()*CODECHARS.length)]).join("");
-  const H = {role:"host", code, players:{}, qs:pickQs(n, topic), qi:-1, phase:"lobby", answers:{}, qStart:0, dur:dur||0, requeue:!!requeue, ready:false, err:"", n, topic};
+  const H = {role:"host", code, players:{}, qs:pickQs(n, topic), qi:-1, phase:"lobby", answers:{}, qStart:0, dur:dur||0, requeue:!!requeue, ready:false, err:"", n, topic, clients:[], up:0, failed:0, born:Date.now()};
   S = H;
-  const peer = new Peer(PREFIX + code); H.peer = peer;
-  peer.on("open", () => { H.ready = true; keepAwake(); draw(); });
-  peer.on("error", e => {
-    if (e.type === "unavailable-id" && tries < 3) return host(n, topic, dur, requeue, tries+1);
-    if (e.type === "peer-unavailable") return;
-    H.err = errText(e); draw();
+  const T = TOPIC(code);
+  const announce = c => { try { c.publish(T+"/host", JSON.stringify({born:H.born}), {retain:true, qos:1}); } catch(e){} };
+  RELAYS.forEach((url, i) => {
+    relayConnect(url, {will:{topic:T+"/host", payload:"", retain:true, qos:1}}).then(c => {
+      if (S !== H) { try { c.end(true); } catch(e){} return; }
+      H.clients[i] = c; H.up++;
+      c.subscribe(T+"/up", {qos:1});
+      announce(c);
+      c.on("message", (tp, buf) => { if (S === H) onMsg(H, i, parse(buf)); });
+      c.on("connect", () => announce(c));
+      if (!H.ready) { H.ready = true; keepAwake(); }
+      draw();
+    }).catch(() => { if (S !== H) return; H.failed++; if (H.failed === RELAYS.length) { H.err = RELAY_ERR; draw(); } });
   });
-  peer.on("disconnected", () => { setTimeout(() => { if (S === H && peer.disconnected && !peer.destroyed) { try { peer.reconnect(); } catch(e){} } }, 1500); });
-  peer.on("connection", conn => {
-    conn.on("data", d => onMsg(H, conn, d));
-    conn.on("close", () => { const tk = conn._tk; if (tk && H.players[tk] && H.players[tk].conn === conn) { H.players[tk].here = false; if (H.phase === "lobby") sendAll(H); draw(); } });
-  });
+  H.beat = setInterval(() => {
+    if (S !== H) return;
+    const now = Date.now(); let changed = false;
+    for (const p of Object.values(H.players)) { const here = now - (p.seen||0) < 16000; if (here !== p.here) { p.here = here; changed = true; } }
+    sendAll(H);
+    if (changed) { draw(); checkAll(H); }
+  }, 4000);
   startTick(); draw();
 }
-function onMsg(H, conn, d){
+function checkAll(H){
+  if (H.phase !== "question") return;
+  const here = Object.keys(H.players).filter(k => H.players[k].here);
+  if (here.length && here.every(k => k in H.answers)) reveal(H);
+}
+function onMsg(H, via, d){
   if (!d || typeof d !== "object") return;
-  if (d.t === "hello") {
-    const tk = String(d.tk || "").slice(0, 20); if (!tk) return;
+  const tk = String(d.tk || "").slice(0, 20); if (!tk) return;
+  let p = H.players[tk];
+  if (d.t === "hello" || (!p && typeof d.name === "string")) {
     const name = String(d.name || "").replace(/\s+/g, " ").trim().slice(0, 20) || "Player";
-    conn._tk = tk;
-    const p = H.players[tk] || (H.players[tk] = {name, pts:0, streak:0});
-    p.name = name; p.conn = conn; p.here = true;
+    p = H.players[tk] || (H.players[tk] = {name, pts:0, streak:0});
+    p.name = name; p.via = via; p.seen = Date.now(); p.here = true;
     if (H.phase === "lobby") sendAll(H); else sendTo(H, tk);
-    draw();
-  } else if (d.t === "answer") {
-    const tk = conn._tk;
-    if (!tk || !H.players[tk] || H.phase !== "question" || d.qi !== H.qi || tk in H.answers) return;
+    draw(); return;
+  }
+  if (!p) return;
+  p.seen = Date.now(); p.via = via;
+  if (!p.here) { p.here = true; draw(); }
+  if (d.t === "answer") {
+    if (H.phase !== "question" || d.qi !== H.qi || tk in H.answers) return;
     const a = Number(d.a); if (!(a === -1 || (a >= 0 && a < H.qs[H.qi].o.length))) return;
     H.answers[tk] = {a, ms:Date.now() - H.qStart};
-    sendTo(H, tk); draw();
-    const here = Object.keys(H.players).filter(k => H.players[k].here);
-    if (here.length && here.every(k => k in H.answers)) reveal(H);
+    sendTo(H, tk); draw(); checkAll(H);
   }
 }
 function ranked(H){ return Object.entries(H.players).sort((a,b) => b[1].pts - a[1].pts); }
@@ -909,7 +943,7 @@ function stateFor(H, tk){
   }
   return st;
 }
-function sendTo(H, tk){ const p = H.players[tk]; if (p && p.conn && p.conn.open) { try { p.conn.send(stateFor(H, tk)); } catch(e){} } }
+function sendTo(H, tk){ const p = H.players[tk]; if (!p) return; const c = (H.clients[p.via] && H.clients[p.via].connected) ? H.clients[p.via] : H.clients.find(x => x && x.connected); if (c) { try { c.publish(TOPIC(H.code)+"/to/"+tk, JSON.stringify(stateFor(H, tk)), {qos:1}); } catch(e){} } }
 function sendAll(H){ for (const tk in H.players) sendTo(H, tk); }
 function nextQuestion(H){
   H.qi++; H.answers = {}; H.phase = "question"; H.qStart = Date.now();
@@ -936,36 +970,40 @@ function reveal(H){
 }
 function finish(H){ H.phase = "final"; sendAll(H); draw(); }
 // ---------- player ----------
-function join(code, name){
+async function join(code, name){
   endSession();
-  const P = {role:"player", code, name, st:null, picked:null, deadline:0, status:"connecting", err:""};
-  S = P;
-  const peer = new Peer(); P.peer = peer;
-  peer.on("open", () => connect(P));
-  peer.on("error", e => { if (S !== P) return; P.status = e.type === "peer-unavailable" ? "nogame" : "error"; P.err = errText(e); draw(); });
-  peer.on("disconnected", () => { setTimeout(() => { if (S === P && peer.disconnected && !peer.destroyed) { try { peer.reconnect(); } catch(e){} } }, 1500); });
-  startTick(); draw();
+  const P = {role:"player", code, name, st:null, picked:null, deadline:0, status:"connecting", err:"", clients:[], last:""};
+  S = P; startTick(); draw();
+  const T = TOPIC(code);
+  let c = null;
+  try { c = await firstRelay(); } catch(e) {}
+  if (S !== P) { if (c) { try { c.end(true); } catch(e){} } return; }
+  if (!c) { P.status = "error"; P.err = RELAY_ERR; draw(); return; }
+  P.c = c; P.clients = [c];
+  c.subscribe([T+"/to/"+token, T+"/host"], {qos:1});
+  c.on("message", (tp, buf) => {
+    if (S !== P) return;
+    if (tp.endsWith("/host")) { const alive = !!(buf && buf.length); if (!alive && P.st && P.st.phase !== "final") { P.status = "hostgone"; draw(); } return; }
+    apply(P, parse(buf));
+  });
+  c.on("connect", () => { if (S === P) { if (P.status === "reconnecting") P.status = P.st ? "in" : "joining"; upP(P, {t:"hello", name:P.name}); draw(); } });
+  c.on("offline", () => { if (S === P && P.status === "in") { P.status = "reconnecting"; draw(); } });
+  P.status = "joining"; upP(P, {t:"hello", name:P.name}); draw();
+  P.beat = setInterval(() => { if (S === P) upP(P, P.st ? {t:"ping", name:P.name} : {t:"hello", name:P.name}); }, 5000);
+  P.timer = setTimeout(() => { if (S === P && !P.st) { P.status = "nogame"; P.err = "No game with that code is running. Check the code with the host."; draw(); } }, 10000);
 }
-function connect(P){
-  const conn = P.peer.connect(PREFIX + P.code, {reliable:true}); P.conn = conn;
-  conn.on("open", () => { if (S !== P) return; P.status = "in"; conn.send({t:"hello", tk:token, name:P.name}); keepAwake(); draw(); });
-  conn.on("data", st => apply(P, st));
-  conn.on("close", () => { if (S === P && P.conn === conn) { P.status = "lost"; draw(); } });
-}
-function rejoin(P){
-  P.status = "connecting"; draw();
-  if (P.peer.destroyed) { const { code, name } = P; return join(code, name); }
-  if (P.peer.disconnected) { try { P.peer.reconnect(); } catch(e){} setTimeout(() => connect(P), 800); } else connect(P);
-}
+function upP(P, msg){ try { if (P.c && P.c.connected) P.c.publish(TOPIC(P.code)+"/up", JSON.stringify(Object.assign({tk:token}, msg)), {qos:1}); } catch(e){} }
 function apply(P, st){
   if (!st || typeof st !== "object" || st.code !== P.code) return;
+  const js = JSON.stringify(st); if (js === P.last && P.status === "in") return; P.last = js;
+  clearTimeout(P.timer); if (P.status !== "in") P.status = "in";
   if (st.phase === "question" && (!P.st || P.st.phase !== "question" || P.st.qi !== st.qi)) { P.picked = st.answered ? -2 : null; P.deadline = st.dur ? Date.now() + (Number(st.left) || 0) : 0; }
   P.st = st; draw();
 }
 function pick(n){
   const P = S; if (!P || P.role !== "player" || !P.st || P.st.phase !== "question" || P.picked !== null) return;
   if (P.deadline && Date.now() > P.deadline) return;
-  P.picked = n; try { P.conn.send({t:"answer", qi:P.st.qi, a:n}); } catch(e){} draw();
+  P.picked = n; upP(P, {t:"answer", qi:P.st.qi, a:n}); draw();
 }
 // the shown question as a question object (for Farsi and for Solve)
 // ---------- drawing ----------
@@ -1002,7 +1040,7 @@ function drawHost(H){
   const players = Object.values(H.players); const here = players.filter(p => p.here);
   let body;
   if (H.err) body = `<div class="stack center"><div class="err">${esc(H.err)}</div><button class="btn primary" id="hRetry">Try again</button></div>`;
-  else if (!H.ready) body = `<div class="stack center"><h2>Setting up the game…</h2><p class="muted">Connecting to the free game service.</p></div>`;
+  else if (!H.ready) body = `<div class="stack center"><h2>Setting up the game…</h2><p class="muted">Connecting to the game relay.</p></div>`;
   else if (H.phase === "lobby") {
     const url = joinUrl(H.code), qr = qrSVG(url);
     body = `<div class="stack center"><span class="eyebrow">Scan, or open this page and enter the code</span>
@@ -1041,9 +1079,9 @@ function drawHost(H){
 }
 function drawPlayer(P){
   const st = P.st; let body;
-  if (P.status === "connecting") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>Joining…</h2></div>`;
+  if (P.status === "connecting" || P.status === "joining") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>Joining…</h2><p class="muted">${P.status === "connecting" ? "Connecting to the game relay…" : "Connected. Looking for the host…"}</p></div>`;
   else if (P.status === "nogame" || P.status === "error") body = `<div class="stack center"><div class="err">${esc(P.err)}</div><div class="row" style="justify-content:center"><button class="btn primary" id="pRetry">Try again</button><button class="btn ghost" id="pBack">Change code</button></div></div>`;
-  else if (P.status === "lost") body = `<div class="stack center"><h2>Connection lost</h2><p class="muted">Your score is saved on the host's screen. Rejoin to keep playing.</p><button class="btn primary" id="pRetry">Rejoin</button></div>`;
+  else if (P.status === "hostgone") body = `<div class="stack center"><h2>The host ended this game</h2><button class="btn primary" id="pBack">Back</button></div>`;
   else if (!st || st.phase === "lobby") body = `<div class="stack center"><span class="eyebrow">Game ${esc(P.code)}</span><h2>${ui(LANG,"You're in","youreIn")}, ${esc(P.name)}</h2><p class="muted">${ui(LANG,"Waiting for the host to start.","waitHost")}${st&&st.players?` ${st.players.length} ${st.players.length===1?"player":"players"} so far.`:""}</p></div>`;
   else if (st.phase === "question") {
     const sq = shownQ(st);
@@ -1065,11 +1103,12 @@ function drawPlayer(P){
     const y = st.you || {};
     body = `<p class="score" style="text-align:center">You finished #${y.rank||"–"} with ${y.pts||0} pts</p>` + podiumHTML(st.board || [], P.name);
   }
+  if (P.status === "reconnecting") body = `<p class="note" style="text-align:center">Reconnecting… your score is safe.</p>` + body;
   main.innerHTML = `<div class="panel stack">${body}<div class="row" style="justify-content:center"><button class="btn ghost" id="pLeave" style="font-size:.88rem">Leave game</button></div></div>`;
   root.querySelectorAll(".kbtn[data-n]").forEach(b => b.onclick = () => pick(+b.dataset.n));
   const on = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
   on("#pSolve", () => pick(-1));
-  on("#pRetry", () => P.status === "lost" ? rejoin(P) : join(P.code, P.name));
+  on("#pRetry", () => join(P.code, P.name));
   on("#pBack", () => { endSession(); home(); });
   on("#pLeave", () => { endSession(); home(); });
   paintTimer();
