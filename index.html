@@ -723,7 +723,7 @@ const FA_WORDS = {
 };
 // Farsi for a few short phrases used on screens
 const FA_UI = {
- correct:"درست است.", wrong:"درست نیست.", why:"چرا", answer:"پاسخ", locked:"پاسخ ثبت شد. منتظر بقیه…", waitNext:"منتظر سؤال بعدی…", youreIn:"وارد شدید", waitHost:"منتظر شروع بازی توسط میزبان.", tooSlow:"وقت تمام شد", notThis:"این بار نه", solved:"پاسخ را دیدید", points:"امتیاز", rank:"رتبهٔ شما", solve:"حل کن (۰ امتیاز)", noLimit:"بدون محدودیت زمان", backAgain:"دوباره آمد", answerC:"پاسخ:", whyC:"چرا:", comeBack:"این سؤال بعداً دوباره می‌آید.", finished:"بازی تمام شد"
+ correct:"درست است.", wrong:"درست نیست.", why:"چرا", answer:"پاسخ", locked:"پاسخ ثبت شد. منتظر بقیه…", waitNext:"منتظر سؤال بعدی…", youreIn:"وارد شدید", waitHost:"منتظر شروع بازی توسط میزبان.", tooSlow:"وقت تمام شد", notThis:"این بار نه", solved:"پاسخ را دیدید", points:"امتیاز", rank:"رتبهٔ شما", solve:"حل کن (۰ امتیاز)", noLimit:"بدون محدودیت زمان", backAgain:"دوباره آمد", answerC:"پاسخ:", whyC:"چرا:", comeBack:"این سؤال بعداً دوباره می‌آید.", finished:"بازی تمام شد", sending:"در حال ارسال پاسخ…"
 };
 // ===== Language helpers (shared by the study site and the no-account game) =====
 const LANGS = {en:"English", both:"English + فارسی", fa:"فارسی"};
@@ -930,9 +930,14 @@ function onMsg(H, via, d){
   if (typeof d.lat === "number" && d.lat >= 0 && d.lat < 60000) { const old = p.lat; p.lat = Math.round(d.lat); if (H.phase === "lobby" && latClass(old) !== latClass(p.lat)) draw(); }
   if (!p.here) { p.here = true; draw(); }
   if (d.t === "answer") {
-    if (H.phase !== "question" || d.qi !== H.qi || tk in H.answers) return;
+    if (H.phase !== "question" || d.qi !== H.qi) return;
+    if (tk in H.answers) { sendTo(H, tk); return; }
     const a = Number(d.a); if (!(a === -1 || (a >= 0 && a < H.qs[H.qi].o.length))) return;
-    H.answers[tk] = {a, ms:Date.now() - H.qStart};
+    // Score on the time the phone measured (tap minus when the question appeared on that phone),
+    // so a slow connection doesn't cost points. Clamp to what's physically possible.
+    const arrived = Date.now() - H.qStart; const el = Number(d.el);
+    const ms = (Number.isFinite(el) && el >= 0) ? Math.min(Math.max(el, 250), arrived) : arrived;
+    H.answers[tk] = {a, ms};
     sendTo(H, tk); draw(); checkAll(H);
   }
 }
@@ -960,7 +965,7 @@ function sendTo(H, tk){ const p = H.players[tk]; if (!p) return; const c = (H.cl
 function sendAll(H){ for (const tk in H.players) sendTo(H, tk); }
 function nextQuestion(H){
   H.qi++; H.answers = {}; H.phase = "question"; H.qStart = Date.now();
-  WT.clear(H.timer); if (H.dur) H.timer = WT.set(() => reveal(H), H.dur*1000 + 500);
+  WT.clear(H.timer); if (H.dur) H.timer = WT.set(() => reveal(H), H.dur*1000 + 1500);
   sendAll(H); draw();
 }
 function reveal(H){
@@ -995,15 +1000,15 @@ async function join(code, name){
     if (chosen || S !== P) return;
     chosen = c; WT.clear(P.probeTimer);
     cands.forEach(x => { if (x !== c) { try { x.end(true); } catch(e){} } });
-    P.c = c; P.clients = [c];
-    c.on("connect", () => { if (S === P) { if (P.status === "reconnecting") P.status = P.st ? "in" : "joining"; upP(P, {t:"hello", name:P.name}, 1); resendAnswer(P); draw(); } });
-    c.on("offline", () => { if (S === P && P.status === "in") { P.status = "reconnecting"; draw(); } });
+    wireRelay(P, c); P.heard = Date.now();
     P.status = "joining"; upP(P, {t:"hello", name:P.name}, 1); draw();
-    P.beat = WT.every(() => { if (S === P) upP(P, P.st ? {t:"ping", name:P.name, ts:Date.now(), lat:P.lat} : {t:"hello", name:P.name}, P.st ? 0 : 1); }, 4000);
+    P.beat = WT.every(() => { if (S !== P) return;
+      upP(P, P.st ? {t:"ping", name:P.name, ts:Date.now(), lat:P.lat} : {t:"hello", name:P.name}, P.st ? 0 : 1);
+      if (P.st && P.st.phase !== "final" && Date.now() - (P.heard||0) > 7000) failover(P); }, 2500);
   };
   RELAYS.forEach(url => relayConnect(url).then(c => {
     if (S !== P || chosen) { try { c.end(true); } catch(e){} return; }
-    cands.push(c);
+    c._url = url; cands.push(c);
     c.on("message", (tp, buf) => {
       if (S !== P) return;
       if (!chosen) { const d = parse(buf); if (d && d.t === "pong" && tp.endsWith("/to/"+token)) { P.lat = Date.now() - (d.ts || Date.now()); choose(c); } return; }
@@ -1014,27 +1019,55 @@ async function join(code, name){
   P.probeTimer = WT.every(() => { if (chosen || S !== P) return WT.clear(P.probeTimer); if (cands.length && P.status === "connecting") { P.status = "looking"; draw(); } cands.forEach(probe); }, 1200);
   P.timer = WT.set(() => { if (S === P && !P.st) { WT.clear(P.probeTimer); cands.forEach(x => { if (x !== P.c) { try { x.end(true); } catch(e){} } }); P.status = "nogame"; P.err = "No game with that code is running. Check the code with the host."; draw(); } }, 12000);
 }
+function wireRelay(P, c){
+  P.c = c; P.clients = [c];
+  c.on("connect", () => { if (S === P && P.c === c) { if (P.status === "reconnecting") P.status = P.st ? "in" : "joining"; upP(P, {t:"hello", name:P.name}, 1); resendAnswer(P); draw(); } });
+  c.on("offline", () => { if (S === P && P.c === c) { if (P.status === "in") { P.status = "reconnecting"; draw(); } if (P.st) failover(P); } });
+}
+// If the current relay goes quiet, quietly move to whichever other relay answers first.
+// The host listens on every relay, so the game carries on without the player noticing.
+function failover(P){
+  if (P.switching) return; P.switching = true;
+  const T = TOPIC(P.code), old = P.c, tried = []; let done = false;
+  const finish = () => { if (S === P) P.switching = false; tried.forEach(x => { if (x !== P.c) { try { x.end(true); } catch(e){} } }); };
+  const giveUp = WT.set(() => { if (!done) { done = true; finish(); } }, 8000);
+  RELAYS.filter(u => !old || u !== old._url).forEach(url => relayConnect(url).then(c => {
+    if (done || S !== P) { try { c.end(true); } catch(e){} return; }
+    c._url = url; tried.push(c);
+    c.on("message", (tp, buf) => {
+      if (S !== P) return;
+      if (!done) { const d = parse(buf); if (d && tp.endsWith("/to/"+token) && (d.t === "pong" || d.code === P.code)) {
+        done = true; WT.clear(giveUp); wireRelay(P, c); P.heard = Date.now(); try { old && old.end(true); } catch(e){}
+        finish(); upP(P, {t:"hello", name:P.name}, 1); resendAnswer(P); if (P.status === "reconnecting") { P.status = "in"; draw(); } }
+        if (d && d.t === "pong") return; }
+      if (c === P.c) onPlayerMsg(P, tp, buf);
+    });
+    c.subscribe([T+"/to/"+token, T+"/host"], {qos:0}, () => { try { c.publish(T+"/up", JSON.stringify({tk:token, t:"probe", ts:Date.now()}), {qos:0}); } catch(e){} });
+  }).catch(() => {}));
+}
 function onPlayerMsg(P, tp, buf){
+  P.heard = Date.now();
   if (tp.endsWith("/host")) { const alive = !!(buf && buf.length); if (!alive && P.st && P.st.phase !== "final") { P.status = "hostgone"; draw(); } return; }
   const d = parse(buf); if (!d) return;
   if (d.t === "pong") { P.lat = Date.now() - (d.ts || Date.now()); const el = $("#lat"); if (el) { el.textContent = `Connection: ${P.lat} ms`; el.className = "lat " + latClass(P.lat); } return; }
   apply(P, d);
 }
 function upP(P, msg, qos=0){ try { if (P.c && P.c.connected) P.c.publish(TOPIC(P.code)+"/up", JSON.stringify(Object.assign({tk:token}, msg)), {qos}); } catch(e){} }
-function resendAnswer(P){ if (P.ans && P.st && P.st.phase === "question" && P.st.qi === P.ans.qi) upP(P, {t:"answer", qi:P.ans.qi, a:P.ans.a}, 1); }
+function resendAnswer(P){ if (P.ans && P.st && P.st.phase === "question" && P.st.qi === P.ans.qi) upP(P, {t:"answer", qi:P.ans.qi, a:P.ans.a, el:P.ans.el}, 1); }
 function apply(P, st){
   if (!st || typeof st !== "object" || st.code !== P.code) return;
   const js = JSON.stringify(st); if (js === P.last && P.status === "in") return; P.last = js;
   WT.clear(P.timer); if (P.status !== "in") P.status = "in";
   if (P.ans && (st.phase !== "question" || st.qi !== P.ans.qi || st.answered)) { WT.clear(P.ansTimer); P.ans = null; }
-  if (st.phase === "question" && (!P.st || P.st.phase !== "question" || P.st.qi !== st.qi)) { P.picked = st.answered ? -2 : null; P.deadline = st.dur ? Date.now() + (Number(st.left) || 0) : 0; }
+  if (st.phase === "question" && (!P.st || P.st.phase !== "question" || P.st.qi !== st.qi)) { P.picked = st.answered ? -2 : null; P.deadline = st.dur ? Date.now() + (Number(st.left) || 0) : 0; P.shownAt = performance.now(); }
   P.st = st; draw();
 }
 function pick(n){
   const P = S; if (!P || P.role !== "player" || !P.st || P.st.phase !== "question" || P.picked !== null) return;
   if (P.deadline && Date.now() > P.deadline) return;
-  P.picked = n; P.ans = {qi:P.st.qi, a:n}; upP(P, {t:"answer", qi:P.st.qi, a:n}, 1);
-  WT.clear(P.ansTimer); P.ansTimer = WT.every(() => { if (S !== P || !P.ans) return WT.clear(P.ansTimer); resendAnswer(P); }, 1500);
+  const el = Math.round(performance.now() - (P.shownAt || performance.now()));
+  P.picked = n; P.ans = {qi:P.st.qi, a:n, el}; upP(P, {t:"answer", qi:P.st.qi, a:n, el}, 1);
+  WT.clear(P.ansTimer); P.ansTimer = WT.every(() => { if (S !== P || !P.ans) return WT.clear(P.ansTimer); resendAnswer(P); }, 1000);
   draw();
 }
 // the shown question as a question object (for Farsi and for Solve)
@@ -1124,7 +1157,7 @@ function drawPlayer(P){
       ${st.dur?`<div class="timer"><i id="ltimer"></i></div>`:""}${questionHTML(st, sq)}
       <div class="kgrid">${st.q.o.map((o,n)=>btnK(n,optLabel(sq,o), solved?(n===sq.a?"win":"dim"):locked?(P.picked===n?"win":"dim"):"", locked)).join("")}</div>
       ${solved?whyHTML(sq, sq.why):""}
-      ${locked?`<p class="muted" style="text-align:center">${solved?ui(LANG,"You saw the answer (0 points).","solved")+" ":""}${ui(LANG,"Answer locked in. Waiting for everyone…","locked")}</p>`:`<div class="row" style="justify-content:center"><button class="btn ghost" id="pSolve">${ui(LANG,"Solve (0 points)","solve")}</button></div>`}`;
+      ${locked?`<p class="muted" style="text-align:center">${solved?ui(LANG,"You saw the answer (0 points).","solved")+" ":""}${st.answered ? "✓ "+ui(LANG,"Answer locked in. Waiting for everyone…","locked") : ui(LANG,"Sending your answer…","sending")}</p>`:`<div class="row" style="justify-content:center"><button class="btn ghost" id="pSolve">${ui(LANG,"Solve (0 points)","solve")}</button></div>`}`;
   } else if (st.phase === "reveal" || st.phase === "last") {
     const y = st.you || {}; const sq = shownQ(st);
     const head = y.ok ? `${ui(LANG,"Correct","correct")}<span class="gain">+${y.gain}</span>` : y.solved ? ui(LANG,"You saw the answer","solved") : y.answered ? ui(LANG,"Not this time","notThis") : ui(LANG,"Too slow","tooSlow");
